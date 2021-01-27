@@ -29,11 +29,12 @@ cc_library(
 
 cc_library (
   name = "exla_device",
-  srcs = ["exla_device.cc"],
   hdrs = ["exla_device.h"],
   deps = [
     "@org_tensorflow//tensorflow/compiler/xla/client:local_client",
     "@org_tensorflow//tensorflow/stream_executor:stream_executor",
+    "@org_tensorflow//tensorflow/compiler/xla/pjrt:event_pool",
+    "@org_tensorflow//tensorflow/compiler/xla/pjrt:local_device_state",
   ],
 )
 
@@ -48,6 +49,7 @@ cc_library(
     "@org_tensorflow//tensorflow/core/framework:allocator",
     "@org_tensorflow//tensorflow/compiler/xla:cpu_function_runtime",
     "@org_tensorflow//tensorflow/compiler/xla/client:client_library",
+    "@org_tensorflow//tensorflow/compiler/xla/pjrt:tracked_device_buffer",
     "@org_tensorflow//tensorflow/compiler/xla/service/gpu:gpu_executable_run_options",
     "@org_tensorflow//tensorflow/core:lib",
   ],

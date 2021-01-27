@@ -1,3 +1,5 @@
+#include <unistd.h>
+
 #include "tensorflow/compiler/xla/exla/exla_client.h"
 #include "tensorflow/compiler/xla/exla/exla_allocator.h"
 #include "tensorflow/compiler/xla/cpu_function_runtime.h"
@@ -115,30 +117,102 @@ void ExlaBuffer::WriteToBuffer(xla::ScopedShapedBuffer* shaped_buffer) {
   state_ = BufferState::kValid;
 }
 
-/*static*/ ExlaBuffer*
+xla::Status ExlaBuffer::BlockHostUntilReady() {
+  switch (state_) {
+    case BufferState::kDeallocated:
+    case BufferState::kDonated:
+      return xla::FailedPrecondition("BlockHostUntilReady() called on \
+                                      deleted or donated buffer");
+    case BufferState::kError:
+      return xla::FailedPrecondition("BlockHostUntilReady() called on \
+                                      buffer in an error state.");
+    case BufferState::kValid:
+      return xla::Status::OK();
+    case BufferState::kWaiting:
+      {
+        std::unique_ptr<se::Stream> stream;
+        for (auto& event : definition_events_) {
+          if (!event->IsComplete()) {
+            if (stream == nullptr) {
+              stream = device_->BorrowStreamFromPool();
+            }
+            event->WaitForEventOnStream(stream.get());
+          }
+        }
+        if (stream != nullptr) {
+          xla::Status block_status = stream->BlockHostUntilDone();
+          if (!block_status.ok()) {
+            return xla::FailedPrecondition("Blocking host failed.");
+          }
+          device_->ReturnStreamToPool(std::move(stream));
+        }
+        state_ = BufferState::kValid;
+        return xla::Status::OK();
+      }
+  }
+  // Something went very wrong
+  LOG(FATAL) << "Buffer is an unknown state";
+}
+
+void ExlaBuffer::WaitForBufferDefinitionEventsOnStream(se::Stream* stream) {
+  for (auto event : definition_events_) {
+    event->WaitForEventOnStream(stream);
+  }
+}
+
+/*static*/ xla::StatusOr<ExlaBuffer*>
 ExlaBuffer::FromScopedShapedBuffer(xla::ScopedShapedBuffer* shaped_buffer,
                                    ExlaDevice* device,
                                    ExlaClient* client,
-                                   BufferType type) {
+                                   BufferType type,
+                                   bool is_uninitialized_create,
+                                   std::shared_ptr<xla::BufferSequencingEvent> definition_event = nullptr) {
+
+  xla::ShapedBuffer released_shaped_buffer = shaped_buffer->release();
+
   xla::ShapeTree<se::DeviceMemoryBase>::iterator iterator =
-    shaped_buffer->buffers().begin();
+    released_shaped_buffer.buffers().begin();
 
   std::vector<se::DeviceMemoryBase> buffers;
   buffers.reserve(1);
 
   xla::ShapeUtil::ForEachSubshape(
-    shaped_buffer->on_device_shape(),
+    released_shaped_buffer.on_device_shape(),
     [&](const xla::Shape&, const xla::ShapeIndex&) {
-      CHECK(iterator != shaped_buffer->buffers().end());
+      CHECK(iterator != released_shaped_buffer.buffers().end());
       buffers.push_back(iterator->second);
       iterator->second = se::DeviceMemoryBase();
       ++iterator;
     });
 
-  CHECK(iterator == shaped_buffer->buffers().end());
+  CHECK(iterator == released_shaped_buffer.buffers().end());
 
-  xla::Shape on_host_shape = shaped_buffer->on_host_shape();
-  xla::Shape on_device_shape = shaped_buffer->on_device_shape();
+  xla::Shape on_host_shape = released_shaped_buffer.on_host_shape();
+  xla::Shape on_device_shape = released_shaped_buffer.on_device_shape();
+
+  absl::InlinedVector<std::shared_ptr<xla::BufferSequencingEvent>, 3>
+      definition_events;
+
+  if (is_uninitialized_create) {
+    if (device->allocation_model() ==
+        xla::LocalDeviceState::kComputeSynchronized) {
+      definition_events.emplace_back(std::make_shared<xla::BufferSequencingEvent>());
+      EXLA_ASSIGN_OR_RETURN(xla::EventPool::Handle event,
+                              device->event_pool().ThenAllocateAndRecordEvent(
+                                device->compute_stream()));
+      definition_events.back()->SetSequencingEvent(
+          std::move(event), device->compute_stream());
+    }
+    if (definition_event) {
+      definition_events.emplace_back(definition_event);
+    }
+  } else {
+    if (definition_event) {
+      definition_events.emplace_back(definition_event);
+    } else {
+      definition_events.emplace_back(std::make_shared<xla::BufferSequencingEvent>());
+    }
+  }
 
   return new ExlaBuffer(
     /*device_memory=*/absl::Span<se::DeviceMemoryBase const>(buffers),
@@ -146,7 +220,8 @@ ExlaBuffer::FromScopedShapedBuffer(xla::ScopedShapedBuffer* shaped_buffer,
     /*on_device_shape=*/on_device_shape,
     /*device=*/device,
     /*client=*/client,
-    /*type=*/type);
+    /*type=*/type,
+    /*definition_events=*/definition_events);
 }
 
 xla::StatusOr<ErlNifBinary> ExlaBuffer::ToBinary() {
@@ -157,6 +232,8 @@ xla::StatusOr<ErlNifBinary> ExlaBuffer::ToBinary() {
   if (empty()) {
     return xla::FailedPrecondition("Attempt to read from deallocated buffer.");
   }
+
+  se::Stream* stream = device_->GetDeviceToHostStream();
 
   bool is_cpu_platform =
     (device_->executor()->platform()->id() ==
@@ -182,7 +259,7 @@ xla::StatusOr<ErlNifBinary> ExlaBuffer::ToBinary() {
 
   EXLA_ASSIGN_OR_RETURN(xla::Literal literal,
     transfer_manager->TransferLiteralFromDevice(
-      device_->device_to_host_stream(),
+      stream,
       shaped_buffer,
       nullptr));
 
@@ -239,11 +316,12 @@ ERL_NIF_TERM BufferToReferenceList(ErlNifEnv* env,
     xla::ScopedShapedBuffer sub_shaped_buffer =
       scoped_shaped_buffer.TakeSubTree({i});
 
-    ExlaBuffer* sub_buffer =
+    EXLA_ASSIGN_OR_RETURN_NIF(ExlaBuffer* sub_buffer,
       ExlaBuffer::FromScopedShapedBuffer(&sub_shaped_buffer,
                                          buffer->device(),
                                          buffer->client(),
-                                         ExlaBuffer::BufferType::kReference);
+                                         ExlaBuffer::BufferType::kReference,
+                                         false), env);
     ERL_NIF_TERM term;
     if (sub_buffer->is_tuple()) {
       term = BufferToReferenceList(env, sub_buffer);
@@ -278,7 +356,7 @@ ExlaBuffer::DecomposeBufferToTerm(ErlNifEnv* env,
 
     EXLA_ASSIGN_OR_RETURN(xla::Literal literal,
       transfer_manager->TransferLiteralFromDevice(
-        buffer->device()->device_to_host_stream(),
+        buffer->device()->GetDeviceToHostStream(),
         shaped_buffer,
         nullptr));
 
@@ -461,21 +539,31 @@ xla::StatusOr<ERL_NIF_TERM> ExlaExecutable::Run(ErlNifEnv* env,
 
   EXLA_ASSIGN_OR_RETURN_NIF(xla::ExecutionOutput results,
     executable->RunAsync(std::move(inputs), run_options), env);
+  xla::ScopedShapedBuffer* result_buffer = results.MutableResult();
 
-  device->compute_stream()->BlockHostUntilDone();
+  se::Stream* stream = device->compute_stream();
+  xla::StatusOr<xla::EventPool::Handle> event_or =
+      device->event_pool().ThenAllocateAndRecordEvent(stream);
 
-  xla::ScopedShapedBuffer result_buffer = results.ConsumeResult();
+  auto definition_event = std::make_shared<xla::BufferSequencingEvent>();
+  definition_event->SetSequencingEvent(event_or.ConsumeValueOrDie(), stream);
 
-  ExlaBuffer* buffer_ref =
-    ExlaBuffer::FromScopedShapedBuffer(&result_buffer,
+  EXLA_ASSIGN_OR_RETURN_NIF(ExlaBuffer* buffer_ref,
+    ExlaBuffer::FromScopedShapedBuffer(result_buffer,
                                        device,
                                        client_,
-                                       ExlaBuffer::BufferType::kReference);
+                                       ExlaBuffer::BufferType::kReference,
+                                       true,
+                                       definition_event),
+    env);
+
+  buffer_ref->BlockHostUntilReady();
+  usleep(100);
 
   EXLA_ASSIGN_OR_RETURN_NIF(ERL_NIF_TERM term,
     ExlaBuffer::DecomposeBufferToTerm(env, buffer_ref, keep_on_device), env);
 
-  if (!keep_on_device) {
+  if (false) {
     // TODO(seanmor5): Deallocation (especially GPU deallocation), seems
     // to have a significant impact in hurting the performance of running
     // on the GPU. It may not be best to do this deallocation explicitly
@@ -564,7 +652,8 @@ ExlaClient::BufferFromBinary(const ErlNifBinary& binary,
       /*on_device_shape=*/on_device_shape,
       /*device=*/device,
       /*client=*/this,
-      /*type=*/ExlaBuffer::BufferType::kZeroCopy);
+      /*type=*/ExlaBuffer::BufferType::kZeroCopy,
+      {});
   } else  {
     ExlaBuffer::BufferType type = transfer_for_run ? ExlaBuffer::BufferType::kTemporary : ExlaBuffer::BufferType::kReference;
 
@@ -575,10 +664,8 @@ ExlaClient::BufferFromBinary(const ErlNifBinary& binary,
 
     client_->backend().transfer_manager()->TransferLiteralToDevice(device->host_to_device_stream(), literal, device_buffer);
 
-    ExlaBuffer* buffer = ExlaBuffer::FromScopedShapedBuffer(&device_buffer,
-                                                            device,
-                                                            this,
-                                                            type);
+    EXLA_ASSIGN_OR_RETURN(ExlaBuffer* buffer,
+      ExlaBuffer::FromScopedShapedBuffer(&device_buffer, device, this, type, false));
 
     return buffer;
   }
@@ -675,7 +762,9 @@ xla::StatusOr<ExlaClient*> GetHostClient(int num_replicas,
     EXLA_ASSIGN_OR_RETURN(se::StreamExecutor* executor,
       platform->GetExecutor(config));
 
-    auto device = std::make_unique<ExlaDevice>(i, executor, client);
+    xla::LocalDeviceState::AllocationModel alloc_model =
+      xla::LocalDeviceState::AllocationModel::kSynchronous;
+    auto device = std::make_unique<ExlaDevice>(i, executor, client, alloc_model, true, false);
     devices.push_back(std::move(device));
   }
   return new ExlaClient(
@@ -713,10 +802,15 @@ xla::StatusOr<ExlaClient*> GetGpuClient(int num_replicas,
     EXLA_ASSIGN_OR_RETURN(se::StreamExecutor* executor,
       client->backend().stream_executor(i));
 
+    xla::LocalDeviceState::AllocationModel alloc_model =
+      xla::LocalDeviceState::AllocationModel::kComputeSynchronized;
     int device_ordinal = executor->device_ordinal();
     devices.push_back(std::make_unique<ExlaDevice>(device_ordinal,
                                                    executor,
-                                                   client));
+                                                   client,
+                                                   alloc_model,
+                                                   true,
+                                                   true));
   }
 
   // TODO(seanmor5): Allocator options should be a configuration option.

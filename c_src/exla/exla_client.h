@@ -8,6 +8,7 @@
 #include "tensorflow/compiler/xla/exla/exla_device.h"
 #include "tensorflow/compiler/xla/exla/exla_nif_util.h"
 #include "tensorflow/compiler/xla/service/gpu/gpu_executable_run_options.h"
+#include "tensorflow/compiler/xla/pjrt/tracked_device_buffer.h"
 #include "tensorflow/core/framework/allocator.h"
 #include "tensorflow/core/platform/types.h"
 #include "tensorflow/core/platform/status.h"
@@ -78,14 +79,16 @@ class ExlaBuffer {
              const xla::Shape& on_device_shape,
              ExlaDevice* device,
              ExlaClient* client,
-             BufferType type)
+             BufferType type,
+             absl::InlinedVector<std::shared_ptr<xla::BufferSequencingEvent>, 3> definition_events)
             : device_memory_(device_memory.begin(), device_memory.end()),
               on_host_shape_(on_host_shape),
               on_device_shape_(on_device_shape),
               device_(device),
               client_(client),
               type_(type),
-              state_(BufferState::kValid) {}
+              state_(BufferState::kValid),
+              definition_events_(std::move(definition_events)) {}
 
   ~ExlaBuffer() {
     Deallocate();
@@ -165,15 +168,21 @@ class ExlaBuffer {
   // shaped buffer to this buffer.
   void WriteToBuffer(xla::ScopedShapedBuffer* shaped_buffer);
 
+  // Block the host until this buffer is ready. A buffer is considered ready
+  // when all of it's definition events have been recorded on a stream.
+  xla::Status BlockHostUntilReady();
+
   // Creates a new ExlaBuffer from the scoped shaped buffer with the given
   // device, client, and type. The ExlaBuffer takes ownership of the
   // underlying device memory and is responsible for deallocating the memory
   // upon destruction or with an explicit deallocation.
-  static ExlaBuffer*
+  static xla::StatusOr<ExlaBuffer*>
   FromScopedShapedBuffer(xla::ScopedShapedBuffer* shaped_buffer,
                          ExlaDevice* device,
                          ExlaClient* client,
-                         BufferType type);
+                         BufferType type,
+                         bool is_unitialized_create,
+                         std::shared_ptr<xla::BufferSequencingEvent> definition_event);
 
   // Decomposes the given buffer to an Erlang VM term. The term is either
   // a binary if the buffer has an array-like shape or a list of the
@@ -207,6 +216,11 @@ class ExlaBuffer {
   // Buffer's current state
   BufferState state_;
 
+  // Buffer's definition events. We make use of PjRt
+  // BufferSequencingEvents as the API is suited towards
+  // exactly the kind of synchronization we need.
+  absl::InlinedVector<std::shared_ptr<xla::BufferSequencingEvent>, 3> definition_events_;
+
   // Donates this buffer to the given xla::ExecutionInput. The input takes
   // ownership of the underlying buffer, and is responsible for deallocating
   // the underlying device memory. Because of that, this buffer is no longer
@@ -219,6 +233,9 @@ class ExlaBuffer {
   // of the underlying memory to the input buffer.
   void AddToInputAsImmutable(xla::ShapeTree<xla::MaybeOwningDeviceMemory>::iterator* iterator,
                              const xla::ShapeTree<xla::MaybeOwningDeviceMemory>::iterator& end);
+
+  // Wait for buffer's definition events on a stream.
+  void WaitForBufferDefinitionEventsOnStream(se::Stream* stream);
 };
 
 
